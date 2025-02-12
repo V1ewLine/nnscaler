@@ -9,7 +9,7 @@ from datasets import load_from_disk
 import huggingface_hub
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
-from modeling_modifier import nnscaler_llama_init
+from lm_models.utils import nnscaler_lm_init
 from chunk_linear_cross_entropy import chunk_linear_cross_entropy
 
 from nnscaler.utils import set_default_logger_level
@@ -59,9 +59,9 @@ def get_tokenizer(tokenizer_name_or_path,
 
 
 class WrapperModel(torch.nn.Module):
-    def __init__(self, model_id, enable_chunk_loss):
+    def __init__(self, model_id, enable_chunk_loss, attn_implementation='flash_attention_2'):
         super().__init__()
-        self.model = AutoModelForCausalLM.from_pretrained(model_id, attn_implementation='flash_attention_2')
+        self.model = AutoModelForCausalLM.from_pretrained(model_id, attn_implementation=attn_implementation)
         self.enable_chunk_loss = enable_chunk_loss
 
     def forward(self, samples):
@@ -116,7 +116,7 @@ def main(args):
 
     set_default_logger_level('INFO')
 
-    nnscaler_llama_init()
+    nnscaler_lm_init(args)
 
     ## Setup Dataset ##
 
@@ -171,8 +171,8 @@ def main(args):
         use_end2end=True,
         pas_config={
             'mem_constraint': args.gpu_mem_constraint,
-            'explore_pipeline': args.explore_pipeline,
             'pipeline_pivots': args.pipeline_pivots,
+            'pipeline_nstages': args.pipeline_nstages,
             'recompute_modules': args.recompute_modules,
         },
         trace_strategy=args.trace_strategy,
@@ -183,6 +183,7 @@ def main(args):
         args={
             'model_id': args.model_id,
             'enable_chunk_loss': args.enable_chunk_loss,
+            'attn_implementation': args.attn_implementation,
         },
     )
 
@@ -311,20 +312,21 @@ if __name__ == '__main__':
         help='trace strategy control the function execution during tracing model graph, `cuda_run_cpu_offload` and `reuse_cache` are recommended, please read `docs/source/parallel_module.md` for more information',
     )
     parser.add_argument(
-        '--enable-chunk-loss',
+        '--enable_chunk_loss',
         action='store_true',
         help='enable chunk loss that exchanges the speed of training for the memory usage',
-    )
-    parser.add_argument(
-        '--explore_pipeline',
-        action='store_true',
-        help='explore pipeline parallelism in autodist',
     )
     parser.add_argument(
         '--pipeline_pivots',
         default='',
         type=str,
-        help='specify the pipeline pivots for autodist',
+        help='explore pipeline parallelism by specifying the pipeline pivots for autodist',
+    )
+    parser.add_argument(
+        '--pipeline_nstages',
+        default=1,
+        type=str,
+        help='specify the number of stages in the pipeline (use "1" to disable pipeline; use "auto" for autodist)',
     )
     parser.add_argument(
         '--recompute_modules',
@@ -344,9 +346,27 @@ if __name__ == '__main__':
         type=int,
         help='max training steps',
     )
+    parser.add_argument(
+        '--attn_implementation',
+        default='flash_attention_2',
+        type=str,
+        help='attn implementation, can be flash_attention_2, spda, eager',
+    )
+    parser.add_argument(
+        '--enable_diff_attn',
+        action='store_true',
+        help='enable diff attention implementation, eager is normal diff attention, flash_attention_2 is diff flash attention, and spda diff attention is not currently supported',
+    )
+    parser.add_argument(
+        '--enable_ring_attn',
+        action='store_true',
+        help='enable ring attention, currently only diff flash attention is supported',
+    )
     args = parser.parse_args()
-    if args.explore_pipeline and not args.pipeline_pivots:
-        raise ValueError('pipeline_pivots must be specified when explore_pipeline is enabled')
+    if args.pipeline_nstages != 'auto':
+        args.pipeline_nstages = int(args.pipeline_nstages)
+        if args.pipeline_nstages > 1 and not args.pipeline_pivots:
+            raise ValueError('pipeline_pivots must be specified when pipeline is enabled')
 
     if os.getenv('DETERMINISTIC'):  # reduce randomness for integration test
         os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'

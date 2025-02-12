@@ -1,6 +1,12 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+"""
+The functions in this file might be inserted as node to graph, to ensure that the inserted node can generate the correct code,
+please following the assumption:
+  - should execute under default context (not under for example, torch.no_grad) no matter what the producer and consumer context are.
+"""
+
 from contextlib import contextmanager
 from typing import Optional, List, Tuple, Union, Any
 import torch
@@ -340,6 +346,18 @@ def setitem(__a, *__bc):
         __b, __c = __bc[:-1], __bc[-1]
     operator.setitem(__a, __b, __c)
     return __a
+
+
+def dict_keys(d: dict):
+    return tuple(d.keys())
+
+
+def dict_values(d: dict):
+    return tuple(d.values())
+
+
+def dict_items(d: dict):
+    return tuple(d.items())
 
 
 def print_time(content: str):

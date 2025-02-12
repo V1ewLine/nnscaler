@@ -114,6 +114,8 @@ Run the following command: ::
 
     python -c 'import os,sys,nnscaler,cppimport.import_hook ; sys.path.append(os.path.dirname(nnscaler.__path__[0])) ; import nnscaler.autodist.dp_solver'
 
+If it complains ``GLIBCXX_x.y.z`` not found, check the next issue.
+
 Example stacktrace: ::
 
     Traceback (most recent call last):
@@ -140,6 +142,25 @@ Example stacktrace: ::
       File ".../nnscaler/autodist/spmd_solver.py", line 1183, in do_dp
         import nnscaler.autodist.dp_solver as dp_solver
     ModuleNotFoundError: No module named 'nnscaler.autodist.dp_solver'
+
+"ImportError: ...... libstdc++.so.6: version \`GLIBCXX_x.y.z' not found"
+-------------------------------------------------------------------------
+
+This is caused by gcc and glibc version mismatch.
+Typically it means it's using the system gcc and conda's glibc.
+
+You can remove conda's glibc to force it use system glibc: ::
+
+    rm <PATH_TO_CONDA_ENV>/lib/libstdc++.so.6
+
+The path is shown in the error message.
+
+Example stacktrace: ::
+
+    $ python -c 'import nnscaler,cppimport.import_hook ; import nnscaler.autodist.dp_solver'
+    Traceback (most recent call last):
+      File "<string>", line 1, in <module>
+    ImportError: /home/user/miniconda3/envs/user/bin/../lib/libstdc++.so.6: version `GLIBCXX_3.4.30' not found (required by .../nnscaler/autodist/dp_solver.cpython-310-x86_64-linux-gnu.so)
 
 Incorrect Usages
 ================
@@ -210,6 +231,38 @@ Example stacktrace: ::
       File ".../torch/amp/autocast_mode.py", line 36, in is_autocast_available
         return torch._C._is_autocast_available(device_type)
     TypeError: _is_autocast_available(): argument 'device_type' (position 1) must be str, not ConcreteAttrProxy
+
+"RuntimeError: Broadcast generated files failed" when use ``run_mode='compile'``
+--------------------------------------------------------------------------------
+
+When using ``Trainer``'s ``run_mode='compile'`` option, ``broadcast_strategy`` must be set to ``'none'``.
+
+How to fix:
+
+.. code-block:: diff
+
+    trainer_args = TrainerArgs(
+        run_mode='compile',
+        ...
+        +broadcast_strategy=('none' if run_mode=='compile' else 'all'),
+    )
+
+Example stacktrace: ::
+
+    Traceback (most recent call last):
+      File "model.py", line 63, in <module>
+        trainer.run()
+      File ".../nnscaler/cli/trainer.py", line 102, in run
+        self._setup()
+      File ".../nnscaler/cli/trainer.py", line 148, in _setup
+        pmodel = parallelize_model(self.train_args, self.dummy_input, load_module=not compile_only)
+      File ".../nnscaler/cli/mixed_module.py", line 281, in parallelize_model
+        return _new_adapter().parallelize(dummy_input, load_module=load_module)
+      File ".../nnscaler/cli/mixed_module.py", line 188, in parallelize
+        pmodel_class = nnscaler.parallelize(
+      File ".../nnscaler/parallel.py", line 1081, in parallelize
+        raise RuntimeError("Broadcast generated files failed: torch.distributed is not initialized.")
+    RuntimeError: Broadcast generated files failed: torch.distributed is not initialized.
 
 Flash Attention Problems
 ========================

@@ -5,19 +5,23 @@ import inspect
 import tempfile
 import re
 from contextlib import nullcontext
+from typing import Union
 
 import torch
 import torch.nn.functional as F
 import pytest
-from torch.torch_version import TorchVersion
+from unittest.mock import patch
 
 from nnscaler.flags import CompileFlag
 import nnscaler.graph.function.dimops
+from nnscaler.graph.function.pyfunc import IRPyFunc
+from nnscaler.graph.parser.mapping import SignFx2Op
+from nnscaler.ir.cten import IR, IRObject
 from nnscaler.parallel import parallelize, ComputeConfig, CubeModule, _gen_graph
 
 from .common import init_distributed
 from ..launch_torchrun import launch_torchrun
-from ..utils import replace_all_device_with
+from ..utils import replace_all_device_with, raises_with_cause
 
 def _to_cube_model(module, compute_config, cube_savedir, load_module):
     return parallelize(
@@ -147,7 +151,7 @@ class TupleReturnModule2(torch.nn.Module):
 @replace_all_device_with('cpu')
 @pytest.mark.parametrize('return_type', [0, 1])
 def test_codegen_tuple_return2(return_type):
-    test_context = nullcontext() if return_type != 0 else pytest.raises(RuntimeError, match='Single tuple outputs.*')
+    test_context = nullcontext() if return_type != 0 else raises_with_cause(RuntimeError, match='Single tuple outputs.*')
     with tempfile.TemporaryDirectory() as tempdir, test_context:
         parallelize(
             TupleReturnModule2(return_type),
@@ -599,7 +603,7 @@ def test_codegen_tensor_slice():
     with tempfile.TemporaryDirectory() as tempdir:
         m = TensorSliceModule()
         m.train()
-        with pytest.raises(RuntimeError, match='Tensor is not supported in slice.'):
+        with raises_with_cause(RuntimeError, match='Tensor is not supported in slice.'):
             parallelize(
                 m,
                 {'x': torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
@@ -899,7 +903,7 @@ def test_codegen_end2end():
             )
             p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=0)  # should success
             if use_pipeline:
-                with pytest.raises(RuntimeError, match='.*Communication generation.*'):
+                with raises_with_cause(RuntimeError, match='.*Communication generation.*'):
                     # fail for non-tensor IRObject return in pipeline mode
                     p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=1)
             else:
@@ -907,13 +911,13 @@ def test_codegen_end2end():
             p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=1)  # should success
             p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=2)  # should success
             p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=2)  # should success
-            with pytest.raises(RuntimeError, match='.*Loss can only be scalar tensor.*'):
+            with raises_with_cause(RuntimeError, match='.*Loss can only be scalar tensor.*'):
                 p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=3)
-            with pytest.raises(RuntimeError, match='.*Loss can only be scalar tensor.*'):
+            with raises_with_cause(RuntimeError, match='.*Loss can only be scalar tensor.*'):
                 p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=3)
-            with pytest.raises(RuntimeError, match='.*Loss can only be scalar tensor.*'):
+            with raises_with_cause(RuntimeError, match='.*Loss can only be scalar tensor.*'):
                 p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=4)
-            with pytest.raises(RuntimeError, match='.*Loss can only be scalar tensor.*'):
+            with raises_with_cause(RuntimeError, match='.*Loss can only be scalar tensor.*'):
                 p(tempdir, use_pipeline=use_pipeline, constant_folding=True, return_type=4)
 
             p(tempdir, use_pipeline=use_pipeline, constant_folding=False, return_type=0, inference_only=True)  # should success
@@ -1218,7 +1222,7 @@ def test_invalid_partition(tmp_path):
     m = CVModel()
     m.train()
 
-    with pytest.raises(ValueError):
+    with raises_with_cause(ValueError):
         parallelize(
             m,
             dummy_input,
@@ -1676,3 +1680,235 @@ def test_fold_constant(tmp_path, fold_input):
         # mul_2_51 = torch.mul(mul_1_57, add_38)
         assert _gencode_contains(tmp_path, CCFModule2, 0,
                                  r'mul_.* = torch\.mul\(mul_.*, add_.*\)')
+
+
+@nnscaler.register_op('? ->')
+def _op1(k):
+    pass
+
+
+@nnscaler.register_op('? -> ?')
+def _op2(k):
+    pass
+
+
+@nnscaler.register_op(' -> ?')
+def _op3():
+    return 1
+
+
+@nnscaler.register_op('? -> ?')
+def _op4(k):
+    return 1 if k else 0
+
+
+class IRNoneModule(torch.nn.Module):
+    def forward(self, x):
+        _op1(2)
+        r = _op2(3)
+        r = _op3() + _op4(r)
+        return x + r
+
+
+@replace_all_device_with('cpu')
+def test_no_return(tmp_path):
+    m = IRNoneModule()
+    m.train()
+    parallelize(
+        m,
+        {'x': torch.randn(128, 64)},
+        'dp',
+        ComputeConfig(1, 1),
+        gen_savedir=tmp_path,
+        reuse='override',
+        load_module=False,
+    )
+    # it should looks like:
+    # def segment19(self, x_23):
+    #     # File "/home/weijiangxu/nanogpt/MagicCube/tests/parallel_module/test_gencode.py", line 1707, in forward,  _op1(2)
+    #     tests.parallel_module.test_gencode._op1(2)
+    #     # File "/home/weijiangxu/nanogpt/MagicCube/tests/parallel_module/test_gencode.py", line 1708, in forward,  r = _op2(3)
+    #     _op2_4 = tests.parallel_module.test_gencode._op2(3)
+    #     # File "/home/weijiangxu/nanogpt/MagicCube/tests/parallel_module/test_gencode.py", line 1709, in forward,  r = _op3() + _op4(r)
+    #     _op3_5 = tests.parallel_module.test_gencode._op3()
+    #     # File "/home/weijiangxu/nanogpt/MagicCube/tests/parallel_module/test_gencode.py", line 1709, in forward,  r = _op3() + _op4(r)
+    #     _op4_6 = tests.parallel_module.test_gencode._op4(_op2_4)
+    #     # File "/home/weijiangxu/nanogpt/MagicCube/tests/parallel_module/test_gencode.py", line 1709, in forward,  r = _op3() + _op4(r)
+    #     add_15 = _operator.add(_op3_5, _op4_6)
+    #     # File "/home/weijiangxu/nanogpt/MagicCube/tests/parallel_module/test_gencode.py", line 1710, in forward,  return x + r
+    #     add_1_20 = torch.add(x_23, add_15, alpha=1)
+    #     del x_23
+    #     return add_1_20
+
+    #  _op1 will not be removed by DCE in tracer
+    assert _gencode_contains(tmp_path, IRNoneModule, 0,
+                                 r'tests\.parallel_module\.test_gencode\._op1')
+
+
+class IRUseNoneModule(torch.nn.Module):
+    def forward(self, x):
+        r = _op3() + _op4(_op1(2))
+        return x + r
+
+
+@replace_all_device_with('cpu')
+def test_use_none_return(tmp_path):
+    m = IRUseNoneModule()
+    m.train()
+    # it should raise an error, because _op1 has no return value, but it is used in _op4
+    with raises_with_cause(KeyError):
+        parallelize(
+            m,
+            {'x': torch.randn(128, 64)},
+            'dp',
+            ComputeConfig(1, 1),
+            gen_savedir=tmp_path,
+            reuse='override',
+            load_module=False,
+        )
+
+
+
+@nnscaler.register_op('? -> ?, ?')
+def _op5(k):
+    return 1 + k, 2
+
+
+def _op6(k):
+    return 1 + k, 2
+
+
+# the ops registered with register_op can't cover all code path in parser
+def Op6(o: Union[int, IRObject], signature=None):
+    o = IR.try_unwrap(o)
+    return IRPyFunc(signature, inputs=[o], outputs=[
+        IRObject(name='_op6', value=o + 1, is_constant=True),
+        IRObject(name='_op6', value=2, is_constant=True),
+    ])
+
+
+class IRMultiOutputModule(torch.nn.Module):
+    def forward(self, x):
+        r0, _ = _op5(2)
+        r1, _ = _op6(3)
+        return x + r0 + r1
+
+
+
+@replace_all_device_with('cpu')
+def test_multi_output_op(tmp_path):
+    SignFx2Op.kOpMap['tests.parallel_module.test_gencode._op6'] = Op6
+
+    from nnscaler.graph.tracer import concrete_trace
+    from nnscaler.graph.tracer.wrap_utils import LeafWrapInfo
+    def patched_concrete_trace(*args, **kwargs):
+        kwargs['dce_ignored_function'].add(_op6)
+        kwargs['autowrap_leaf_function'][_op6] = LeafWrapInfo([], True, None)
+
+        return concrete_trace(*args, **kwargs)
+
+    with patch(
+        "nnscaler.graph.parser.converter.concrete_trace",
+        side_effect=patched_concrete_trace
+    ):
+        m = IRMultiOutputModule()
+        m.train()
+        parallelize(
+            m,
+            {'x': torch.randn(128, 64)},
+            'dp',
+            ComputeConfig(1, 1),
+            gen_savedir=tmp_path,
+            reuse='override',
+            load_module=False,
+        )
+
+    SignFx2Op.kOpMap.pop('tests.parallel_module.test_gencode._op6')
+    # should success
+    assert True
+
+
+class InitErrorModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        raise ValueError('world error')
+
+    def forward(self, input):
+        pass
+
+
+def _gencode_init_error_worker(tmp_path, without_init_distributed=False):
+    if not without_init_distributed:
+        init_distributed()
+    try:
+        m_new = parallelize(
+            InitErrorModule,
+            {
+                'input': torch.randn(2, 3, 32, 32),
+            },
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=True
+        )
+    except Exception as e:
+        assert isinstance(e, RuntimeError)
+        if without_init_distributed or torch.distributed.get_rank() == 0:
+            root_cause = e.__cause__
+            while root_cause.__cause__ is not None:
+                root_cause = root_cause.__cause__
+            assert isinstance(root_cause, ValueError)
+            assert root_cause.args[0] == 'world error'
+        else:
+            assert e.__cause__ is None
+
+
+@replace_all_device_with('cpu')
+def test_codegen_init_error_compile(tmp_path):
+    _gencode_init_error_worker(tmp_path, without_init_distributed=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of GPU devices')
+def test_codegen_init__error(tmp_path):
+    launch_torchrun(2, _gencode_init_error_worker, tmp_path)
+
+
+class ForwardErrorModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, input):
+        raise ValueError('hello error')
+
+
+def _gencode_forward_error_worker(tmp_path, without_init_distributed=False):
+    if not without_init_distributed:
+        init_distributed()
+    try:
+        m_new = parallelize(
+            ForwardErrorModule,
+            {
+                'input': torch.randn(2, 3, 32, 32),
+            },
+            'dp',
+            ComputeConfig(1, 2),
+            gen_savedir=tmp_path,
+            load_module=True
+        )
+    except Exception as e:
+        assert isinstance(e, RuntimeError)
+        if without_init_distributed or torch.distributed.get_rank() == 0:
+            assert isinstance(e.__cause__, ValueError)
+            assert e.__cause__.args[0] == 'hello error'
+        else:
+            assert e.__cause__ is None
+
+
+@replace_all_device_with('cpu')
+def test_codegen_forward_error_compile(tmp_path):
+    _gencode_forward_error_worker(tmp_path, without_init_distributed=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason='lack of GPU devices')
+def test_codegen_forward_error(tmp_path):
+    launch_torchrun(2, _gencode_forward_error_worker, tmp_path)

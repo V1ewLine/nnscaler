@@ -32,6 +32,7 @@ from nnscaler.graph.function.anchor import IRGraphAnchor
 from nnscaler.graph.function.dimops import IRDimops
 from nnscaler.graph.segment import IRSegment
 from nnscaler.ir.operator import IRDataOperation, IRFwOperation
+from nnscaler.ir import IRCell, IRSubTensor, IRFullTensor
 
 
 if TYPE_CHECKING:
@@ -44,7 +45,7 @@ _logger = logging.getLogger(__name__)
 def _tp(graph: IRGraph, node: IRDimops, devs: List[int], idx: int, dim: int):
     if len(devs) > 1:
         sub_nodes = graph.partition(
-            node, node.algorithms('dim'), idx=idx, dim=dim, num=len(devs))
+            node, node.algorithm('dim'), idx=idx, dim=dim, num=len(devs))
     else:
         sub_nodes = [node]
     for devid, sub_node in zip(devs, sub_nodes):
@@ -57,6 +58,21 @@ def _replica(graph: IRGraph, node, devs: List[int]):
     for devid, sub_node in zip(devs, sub_nodes):
         graph.assign(sub_node, devid)
     return sub_nodes
+
+
+def is_tensor_in_output(t: IRFullTensor, graph: IRSegment) -> bool:
+    for output in IRCell.get_objects_from_complex(graph.outputs()):
+        if isinstance(output, IRSubTensor) and output.parent == t:
+            return True
+    return False
+
+
+def auto_multiref(graph: IRGraph):
+    for ftensor in graph.full_tensors():
+        if ftensor.is_grad(): continue
+        in_output = int(is_tensor_in_output(ftensor, graph))
+        if len(graph.consumers(ftensor)) + in_output > 1:
+            graph.multiref(ftensor, comment='auto_multiref')
 
 
 def pas_dp(graph: IRGraph, cfg: 'ComputeConfig'):
@@ -85,10 +101,7 @@ def pas_tp(graph: IRGraph, cfg: 'ComputeConfig'):
     random.seed(seed)
     devs = list(range(ngpus))
 
-    for ftensor in graph.full_tensors():
-        if ftensor.is_grad(): continue
-        if len(graph.consumers(ftensor)) > 1:
-            graph.multiref(ftensor)
+    auto_multiref(graph)
 
     for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
         if node.name == 'multiref' or isinstance(node, IRGraphAnchor):
@@ -103,7 +116,7 @@ def pas_tp(graph: IRGraph, cfg: 'ComputeConfig'):
                 random.shuffle(configs)
                 for (idx, dim) in configs:
                     if node.input(idx).shape[dim] % len(devs) != 0: continue
-                    if node.algorithms('dim').satisfy(idx=idx, dim=dim, num=len(devs)):
+                    if node.algorithm('dim').satisfy(idx=idx, dim=dim, num=len(devs)):
                         _tp(graph, node, devs, idx, dim)
                         break
                 else:
@@ -120,7 +133,8 @@ def pas_pp(graph: IRGraph, cfg: 'ComputeConfig'):
     """
     pipeline parallelism inside a scale unit, and dp across scale units
     """
-    if cfg.pas_config.get('pipeline_nstages', cfg.plan_ngpus) != cfg.plan_ngpus:
+    nstages = cfg.pas_config.get('pipeline_nstages', 'auto')
+    if nstages != 'auto' and nstages != cfg.plan_ngpus:
         raise ValueError("pas_pp requires pipeline_nstages == plan_ngpus")
     return pas_hybrid(graph, cfg)
 
@@ -130,10 +144,7 @@ def pas_data(graph: IRGraph, env_resource: 'ComputeConfig'):
     tensor partition on batch dimension inside a scale unit, and dp across scale units
     """
     ngpus = env_resource.plan_ngpus
-    # auto multi-ref
-    for ftensor in graph.full_tensors():
-        if len(graph.consumers(ftensor)) > 1:
-            graph.multiref(ftensor, [[n] for n in graph.consumers(ftensor)])
+    auto_multiref(graph)
 
     batch_dim = 0
     for dl in graph.select(ntype=IRDataOperation):
@@ -142,7 +153,7 @@ def pas_data(graph: IRGraph, env_resource: 'ComputeConfig'):
     for node in graph.nodes():
         if isinstance(node, IRFwOperation):
             try:
-                algo = node.algorithms('dim')
+                algo = node.algorithm('dim')
                 idx = 0
                 sub_nodes = graph.partition(
                     node, algo, idx=idx, dim=batch_dim, num=ngpus)
@@ -160,20 +171,25 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
     """
     if not cfg.use_end2end:
         raise ValueError("Hybrid policy only supports end2end module")
-    if cfg.use_async_reducer:
-        raise ValueError("Hybrid policy does not support async reducer")
 
     ngpus: int = cfg.plan_ngpus
-    nstages = cfg.pas_config.get('pipeline_nstages', cfg.plan_ngpus)
+    nstages = cfg.pas_config.get('pipeline_nstages', 'auto')
+    if nstages == 'auto':
+        nstages = cfg.plan_ngpus
     nmicros = cfg.pas_config['pipeline_nmicros']
     scheduler = cfg.pas_config.get('pipeline_scheduler', '1f1b')
-    tp_size: int = cfg.plan_ngpus // nstages
-    if ngpus % tp_size != 0:
-        raise ValueError(f'invalid tp_size {tp_size} for ngpus {ngpus}')
-    pp_size = ngpus // tp_size
+    pp_size = cfg.pas_config.get('pp_size', nstages)
 
+    if nstages % pp_size != 0:
+        raise ValueError(f'invalid pp_size {pp_size} for nstages {nstages}')
+    if ngpus % pp_size != 0:
+        raise ValueError(f'invalid pp_size {pp_size} for ngpus {ngpus}')
+    tp_size = ngpus // pp_size
+
+
+    auto_multiref(graph)
     fnodes = graph.select(ntype=IRFwOperation)
-    stages = mitr.divide(pp_size, fnodes)
+    stages = mitr.divide(nstages, fnodes)
     stages = [list(s) for s in stages]
     for idx, stage in enumerate(stages):
         _logger.info(f'> stage {idx}: {stage[0]}')
@@ -181,19 +197,18 @@ def pas_hybrid(graph: IRGraph, cfg: 'ComputeConfig'):
 
     stages: List[IRSegment] = graph.select(ntype=IRSegment, flatten=False)
     stages = [s for s in stages if s.isfw()]
-    assert len(stages) == pp_size, "Internal Error"
+    assert len(stages) == nstages, "Internal Error"
 
     # stage-wise tensor parallelism
     curr_devices = list(range(ngpus))
-    for stage in stages:
+    for idx, stage in enumerate(stages):
+        idx = idx % pp_size
+        devs = curr_devices[idx * tp_size: (idx + 1)* tp_size]
         for node in stage.nodes():
-            devs = curr_devices[:tp_size]
             try:
                 _tp(graph, node, devs, idx=0, dim=0)
             except Exception as e:
                 _replica(graph, node, devs)
-        curr_devices = curr_devices[tp_size:]
-    assert len(curr_devices) == 0, f"remaining devices: {curr_devices} not used"
 
     # replicate dataloader
     for dl in graph.select(ntype=IRDataOperation):
@@ -211,11 +226,29 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         update_freq = update_freq[0]
 
     # optional parameters
-    explore_pipeline = pas_cfg.get('explore_pipeline', False)
-    if explore_pipeline and not cfg.use_end2end:
-        raise ValueError("explore_pipeline cannot be enabled if use_end2end is False")
-    if explore_pipeline and cfg.use_async_reducer:
-        raise ValueError("explore_pipeline cannot be enabled if use_async_reducer is True")
+
+    # Note we don't directly pass pipeline_nstages to autodist.
+    # when `pipeline_nstages == 'auto'`, we will check if there are options incompatible with pipeline.
+    # if we find incompabible options (here use_async_reducer and pipeline_pivots),
+    # we will disable pipeline effectively by setting it to 1.
+    pipeline_nstages = pas_cfg.get('pipeline_nstages', 'auto')
+
+    if pipeline_nstages == 'auto':
+        if not pas_cfg.get('pipeline_pivots'):
+            pipeline_nstages = 1
+        if not cfg.use_end2end or cfg.use_async_reducer:
+            pipeline_nstages = 1
+    elif pipeline_nstages > 1:
+        # the user manually enabled pipeline, should not disable, so raise
+        if not pas_cfg.get('pipeline_pivots'):
+            raise ValueError("pipeline_pivots must be set to enable pipeline")
+        if not cfg.use_end2end:
+            raise ValueError("explore_pipeline cannot be enabled if use_end2end is False")
+        if cfg.use_async_reducer:
+            raise ValueError("explore_pipeline cannot be enabled if use_async_reducer is True")
+    else:
+        if pas_cfg.get('pipeline_pivots'):
+            raise ValueError("pipeline_pivots must not be set because pipeline is disabled by pipeline_nstages<=1")
 
     pipeline_scheduler = pas_cfg.get('pipeline_scheduler', '1f1b')
     if pipeline_scheduler != '1f1b':
@@ -225,7 +258,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     if cfg.plan_ngpus % mesh_col != 0:
         raise ValueError(f"plan_ngpus {cfg.plan_ngpus} should be divisible by max_partition_degree {mesh_col}")
     mesh_row = cfg.plan_ngpus // mesh_col
-    if not explore_pipeline and mesh_row != 1:
+    if pipeline_nstages == 1 and mesh_row != 1:
         raise ValueError("mesh_row should be 1 if pipeline is not enabled")
     memory_constraint = pas_cfg.get('mem_constraint', -1)
     task_name = pas_cfg.get('task_name', '_')
@@ -240,6 +273,7 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
     partition_constraints_path = pas_cfg.get('partition_constraints_path', '')
     recompute_modules = pas_cfg.get('recompute_modules', '')
     pipeline_pivots = pas_cfg.get('pipeline_pivots', '')
+    max_pipeline_bubble_ratio = pas_cfg.get('max_pipeline_bubble_ratio', 0.2)
     use_apex_fused_adam_v2 = pas_cfg.get('use_apex_fused_adam_v2', False)
     parallel_profile = pas_cfg.get('parallel_profile', True)
     transient_mem_coef = pas_cfg.get('transient_mem_coef', 2)
@@ -303,8 +337,9 @@ def pas_autodist(graph: IRGraph, cfg: 'ComputeConfig') -> IRGraph:
         zero_ngroups=zero_ngroups,
         load_plan_path=load_plan_path,
         save_plan_path=save_plan_path,
-        pipeline=explore_pipeline,
         pipeline_pivots=pipeline_pivots,
+        pipeline_nstages=pipeline_nstages,
+        max_pipeline_bubble_ratio=max_pipeline_bubble_ratio,
         parallel_profile=parallel_profile,
         transient_mem_coef=transient_mem_coef,
     )
